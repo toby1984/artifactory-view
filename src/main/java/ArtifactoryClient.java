@@ -83,13 +83,13 @@ public class ArtifactoryClient
 
     private HttpClient client;
 
-    private int maxHostConnections = 10;
-    private String apiUrl;
-    private String user;
-    private String password;
+    private volatile int maxHostConnections = 10;
+    private volatile String apiUrl;
+    private volatile String user;
+    private volatile String password;
 
-    private boolean needsReconnect = true;
-    private boolean isConnected = false;
+    private volatile boolean needsReconnect = true;
+    private volatile boolean isConnected = false;
 
     public ArtifactoryClient() {
     }
@@ -133,7 +133,12 @@ public class ArtifactoryClient
                 return;
             }
             System.out.println("Disconnecting, configuration has changed");
-            disconnect();
+            try
+            {
+                disconnect();
+            } finally {
+                needsReconnect = false;
+            }
         }
 
         // host configuration
