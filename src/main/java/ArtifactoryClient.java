@@ -132,6 +132,7 @@ public class ArtifactoryClient
             if ( ! needsReconnect() ) {
                 return;
             }
+            System.out.println("Disconnecting, configuration has changed");
             disconnect();
         }
 
@@ -258,6 +259,7 @@ public class ArtifactoryClient
         try
         {
             // execute method
+            connect();
             final HttpMethod httpMethod = new GetMethod( API_URL + url );
             client.executeMethod( httpMethod );
             if ( httpMethod.getStatusCode() != 200 )

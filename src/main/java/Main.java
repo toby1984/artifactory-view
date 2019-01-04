@@ -2,28 +2,32 @@ import de.engehausen.treemap.IRectangle;
 import de.engehausen.treemap.impl.GenericTreeModel;
 import de.engehausen.treemap.swing.TreeMap;
 
+import javax.swing.DefaultComboBoxModel;
 import javax.swing.DefaultListCellRenderer;
 import javax.swing.JButton;
 import javax.swing.JComboBox;
 import javax.swing.JFrame;
+import javax.swing.JLabel;
 import javax.swing.JList;
 import javax.swing.JPanel;
 import javax.swing.JTextField;
+import javax.swing.SwingUtilities;
 import java.awt.Component;
 import java.awt.Dimension;
+import java.awt.FlowLayout;
 import java.awt.GridBagConstraints;
 import java.awt.GridBagLayout;
 import java.awt.event.MouseAdapter;
 import java.awt.event.MouseEvent;
 import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
-import java.util.ArrayList;
-import java.util.Comparator;
 import java.util.List;
 import java.util.Locale;
 import java.util.Optional;
 import java.util.Stack;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Predicate;
 import java.util.regex.Pattern;
 
@@ -34,9 +38,17 @@ public class Main
     private static final Pattern TZ_PATTERN = Pattern.compile(".*?(\\+|-)\\d{2,}(:)?\\d*$");
 
     private static final MyTreeMap treeMap = new MyTreeMap();
-    private static Optional<ArtifactoryClient.Repository> currentData = Optional.empty();
+    private static Optional<ArtifactoryClient.Repository> currentRepo = Optional.empty();
     private static Predicate<SizeAndLatestDate> nodeFilter = node -> true;
     private static JFrame frame;
+    private static final JComboBox<ArtifactoryClient.Repository> choices = new JComboBox<>();
+
+    private static final AtomicBoolean stopWorker = new AtomicBoolean();
+    private static Thread currentWorker = null;
+
+    private static final JTextField apiUrl = new JTextField("http://localhost:8081/artifactory/api");
+    private static final JTextField apiUser = new JTextField("apiuser");
+    private static final JTextField apiPassword = new JTextField("apitest");
 
     private static final DateTimeFormatter[] DATE_FORMATS =
             {
@@ -51,16 +63,13 @@ public class Main
     private static final ArtifactoryClient client = new ArtifactoryClient();
     private static ArtifactoryScanner scanner;
 
+    private static boolean fetchRepos = true;
+
     public static void main(String[] args) throws Exception
     {
         client.setMaxHostConnections( 10 );
-        client.setApiUrl( "http://localhost:8081/artifactory/api" );
-        client.setCredentials( "apiuser","apitest" );
-
-        client.connect();
-
         scanner = new ArtifactoryScanner( client );
-        visualize( client.getRepositories() );
+        init();
     }
 
     private static GenericTreeModel<SizeAndLatestDate> createTreeModel(SizeAndLatestDate root, Predicate<SizeAndLatestDate> pred)
@@ -73,7 +82,6 @@ public class Main
                 accepted.incrementAndGet();
                 return true;
             }
-            System.out.println("Rejected by filter: "+item);
             rejected.incrementAndGet();
             return false;
         };
@@ -107,19 +115,143 @@ public class Main
         }
     }
 
-    private static void refreshTreemap()
+    private static void refreshTreemap(Optional<ArtifactoryClient.Repository> repository)
     {
-        frame.setTitle( currentData.isPresent() ? currentData.get().repoId : "--" );
-        currentData.ifPresent( node ->
+        if ( repository.isPresent() )
         {
-            final SizeAndLatestDate nodes = scanner.scanRepo( node );
-            treeMap.setTreeModel( createTreeModel( nodes, nodeFilter ) );
-        });
+            while ( currentWorker != null && currentWorker.isAlive() )
+            {
+                stopWorker.set(true);
+                try {
+                    Thread.sleep(300);
+                }
+                catch (InterruptedException e)
+                {
+                    e.printStackTrace();
+                }
+            }
+
+            stopWorker.set(false);
+
+            final Thread newWorker = new Thread( ()->
+            {
+                final AtomicReference<ProgressDialog> dialogRef = new AtomicReference();
+                try
+                {
+                    runOnEDT( () ->
+                    {
+                        final String msg = "Scanning "+repository.get().repoId+" ...";
+                        final ProgressDialog dialog = new ProgressDialog(msg,frame)
+                        {
+                            @Override
+                            protected void cancelPressed()
+                            {
+                                stopWorker.set(true);
+                            }
+                        };
+                        dialogRef.set(dialog);
+                    },true);
+                    final ArtifactoryScanner.IProgressReporter reporter =
+                            new ArtifactoryScanner.IProgressReporter()
+                            {
+                                private final AtomicInteger count = new AtomicInteger();
+
+                                @Override
+                                public void itemScanned()
+                                {
+                                    final int cnt = count.incrementAndGet();
+                                    if ( ( cnt % 100 ) == 0 )
+                                    {
+                                        SwingUtilities.invokeLater( () ->
+                                        {
+                                            final ProgressDialog progressDialog = dialogRef.get();
+                                            if ( progressDialog != null )
+                                            {
+                                                progressDialog.updateProgress( "Scanned: " + cnt + " items" );
+                                            }
+                                        });
+                                    }
+                                }
+                            };
+
+                    final SizeAndLatestDate nodes = scanner.scanRepo( repository.get(), stopWorker::get, reporter );
+                    runOnEDT( () ->
+                    {
+                        frame.setTitle( repository.get().repoId );
+                        treeMap.setTreeModel( createTreeModel( nodes, nodeFilter ) );
+                    });
+                }
+                catch (InterruptedException e)
+                {
+                    // ok, we got interrupted
+                }
+                finally
+                {
+                    runOnEDT( () ->
+                    {
+                        final ProgressDialog dialog = dialogRef.get();
+                        if ( dialog != null )
+                        {
+                            dialog.dispose();
+                        }
+                    } );
+                }
+
+            },"worker");
+            newWorker.setDaemon( true );
+            newWorker.start();
+            currentWorker = newWorker;
+        } else {
+            frame.setTitle( "--" );
+        }
+        currentRepo = repository;
     }
 
-    private static void visualize(List<ArtifactoryClient.Repository> repositories)
+    public static void runOnEDT(Runnable r) {
+        runOnEDT(r,false);
+    }
+
+    public static void runOnEDT(Runnable r,boolean later)
     {
-        currentData = repositories.stream().findFirst();
+        if ( SwingUtilities.isEventDispatchThread() ) {
+            r.run();
+        }
+        else
+        {
+            try
+            {
+                if ( later ) {
+                    SwingUtilities.invokeLater( r );
+                }
+                else {
+                    SwingUtilities.invokeAndWait( r );
+                }
+            }
+            catch (Exception e)
+            {
+                e.printStackTrace();
+            }
+        }
+    }
+
+    private static void fetchRepos()
+    {
+        if ( fetchRepos )
+        {
+            System.out.println( "Fetching repositories..." );
+            final List<ArtifactoryClient.Repository> repos = client.getRepositories();
+            System.out.println( "Got " + repos.size() + " repositories" );
+            choices.setModel( new DefaultComboBoxModel<>( repos.toArray( ArtifactoryClient.Repository[]::new ) ) );
+            if ( ! repos.isEmpty() ) {
+                choices.setSelectedItem( repos.get(0) );
+            }
+            fetchRepos = false;
+        }
+    }
+
+    private static void init()
+    {
+        currentRepo = Optional.empty();
 
         // setup frame
         frame = new JFrame() ;
@@ -135,7 +267,6 @@ public class Main
         treeMap.setRectangleRenderer( treeRenderer );
         treeMap.setPreferredSize(  new Dimension(640,480) );
         treeMap.setSize(  new Dimension(640,480) );
-        refreshTreemap();
         treeMap.addMouseMotionListener( new MouseAdapter()
         {
             @Override
@@ -156,7 +287,6 @@ public class Main
         });
 
         // choices dropdown
-        final JComboBox<ArtifactoryClient.Repository> choices = new JComboBox<>( repositories.toArray( ArtifactoryClient.Repository[]::new ) );
         choices.setRenderer( new DefaultListCellRenderer()
         {
             @Override
@@ -166,16 +296,14 @@ public class Main
                 final Component result = super.getListCellRendererComponent( list, value, index,
                         isSelected, cellHasFocus );
                 final ArtifactoryClient.Repository data = (ArtifactoryClient.Repository) value;
-                setText( data.repoId );
+                if ( data != null )
+                {
+                    setText( data.repoId );
+                }
                 return result;
             }
         });
-        currentData.ifPresent( choices::setSelectedItem );
-        choices.addActionListener( ev ->
-        {
-            currentData  = Optional.of( (SizeAndLatestDate) choices.getSelectedItem() );
-            refreshTreemap();
-        });
+        currentRepo.ifPresent( choices::setSelectedItem );
 
         // 'last modified' restriction
         final JTextField lastModified = new JTextField(15);
@@ -201,7 +329,6 @@ public class Main
                         continue;
                     }
                     nodeFilter = node -> node.latestDate == null || ! node.isLeaf() || node.latestDate.isBefore( date );
-                    refreshTreemap();
                     return;
                 }
                 System.err.println("*** Unparseable date: "+text);
@@ -209,7 +336,6 @@ public class Main
             else if ( text == null || text.isBlank() )
             {
                 nodeFilter = node -> true;
-                refreshTreemap();
             }
         });
 
@@ -217,38 +343,58 @@ public class Main
         final JButton applyButton = new JButton("Apply");
         applyButton.addActionListener( ev ->
         {
-            refreshTreemap();
+            client.setApiUrl( apiUrl.getText() );
+            client.setCredentials( apiUser.getText(), apiPassword.getText() );
+            fetchRepos();
+            final Optional<ArtifactoryClient.Repository> selected = Optional.ofNullable( (ArtifactoryClient.Repository) choices.getSelectedItem() );
+            refreshTreemap(selected);
         });
 
-        // compose panel
+        // API URL & credentials
+        final JPanel buttonPanel = new JPanel();
+        buttonPanel.setLayout( new FlowLayout() );
+        buttonPanel.add( new JLabel("URL"));
+        buttonPanel.add( apiUrl );
+        buttonPanel.add( new JLabel("User"));
+        buttonPanel.add( apiUser );
+        buttonPanel.add( new JLabel("Password"));
+        buttonPanel.add( apiPassword );
+
         final JPanel panel = new JPanel();
         panel.setLayout(  new GridBagLayout() );
 
         GridBagConstraints cnstrs = new GridBagConstraints();
-        cnstrs.weightx=0.8; cnstrs.weighty = 0;
+        cnstrs.weightx=1; cnstrs.weighty = 0;
         cnstrs.fill = GridBagConstraints.HORIZONTAL;
         cnstrs.gridx = 0 ; cnstrs.gridy = 0;
+        cnstrs.gridwidth = 3 ; cnstrs.gridheight = 1;
+        panel.add( buttonPanel, cnstrs);
+
+        cnstrs = new GridBagConstraints();
+        cnstrs.weightx=0.8; cnstrs.weighty = 0;
+        cnstrs.fill = GridBagConstraints.HORIZONTAL;
+        cnstrs.gridx = 0 ; cnstrs.gridy = 1;
         cnstrs.gridwidth = 1 ; cnstrs.gridheight = 1;
         panel.add( choices, cnstrs);
 
         cnstrs = new GridBagConstraints();
         cnstrs.weightx=0.2; cnstrs.weighty = 0;
         cnstrs.fill = GridBagConstraints.HORIZONTAL;
-        cnstrs.gridx = 1 ; cnstrs.gridy = 0;
+        cnstrs.gridx = 1 ; cnstrs.gridy = 1;
         cnstrs.gridwidth = 1 ; cnstrs.gridheight = 1;
         panel.add( lastModified, cnstrs);
 
         cnstrs = new GridBagConstraints();
         cnstrs.weightx=1; cnstrs.weighty = 1;
         cnstrs.fill = GridBagConstraints.NONE;
-        cnstrs.gridx = 2 ; cnstrs.gridy = 0;
+        cnstrs.gridx = 2 ; cnstrs.gridy = 1;
         cnstrs.gridwidth = 1; cnstrs.gridheight = 1;
         panel.add( applyButton, cnstrs );
 
         cnstrs = new GridBagConstraints();
         cnstrs.weightx=1; cnstrs.weighty = 1;
         cnstrs.fill = GridBagConstraints.BOTH;
-        cnstrs.gridx = 0 ; cnstrs.gridy = 1;
+        cnstrs.gridx = 0 ; cnstrs.gridy = 2;
         cnstrs.gridwidth = 3; cnstrs.gridheight = 1;
         panel.add( treeMap,cnstrs );
 
